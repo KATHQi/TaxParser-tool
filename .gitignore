@@ -1,0 +1,70 @@
+# === 备份和旧版本文件 ===
+app.py
+app-backup.py
+app-test8003.py
+tax_document_parser-temp.py
+
+# === SSL 证书（安全性） ===
+*.pem
+cert.pem
+key.pem
+
+# === 临时记录文件 ===
+pdf2excel.txt
+运行命令.txt
+
+# === 系统和硬件特定文件 ===
+xserver-xorg-video-nvidia-515
+
+# === 运行脚本（可选保留，一般不上传） ===
+*.sh
+health_check.sh
+start_app_test_2026.sh
+start_gunicorn.sh
+start_taxparser.sh
+stop_gunicorn.sh
+stop_taxparser.sh
+restart_taxparser.sh
+
+# === 临时和输出目录 ===
+data/
+log/
+output/
+results/
+tempimg/
+temp_downloads/
+temp_pdf_images/
+tax_parser_output/
+
+# === IDE 和编辑器缓存 ===
+__pycache__/
+.ipynb_checkpoints/
+.history/
+.vscode/
+.idea/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.swp
+*.swo
+*~
+
+# === Python 虚拟环境 ===
+venv/
+env/
+ENV/
+.venv
+
+# === 日志和配置 ===
+*.log
+.env
+.env.local
+
+# === IDE 生成的文件 ===
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
