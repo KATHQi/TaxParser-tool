@@ -1,6 +1,6 @@
 """
 Tax Document Parser - Flask API Service
-端口: 8889
+端口: 8001
 功能: 接收服务器路径，处理图像，返回解析结果和可视化
 """
 
@@ -20,6 +20,7 @@ import requests
 from urllib.parse import urlparse, unquote
 import mimetypes
 import pandas as pd
+from tax_postprocessor import postprocess_internal_results
 
 
 # 必须尽早设置，且在任何导入会触发 Paddle/BLAS 初始化的模块之前
@@ -84,6 +85,129 @@ def make_json_response(obj, status=200):
         status=status,
         mimetype='application/json; charset=utf-8'
     )
+
+
+# 下游接口固定使用的表格字段。无论上游表格模型返回 4 列、6 列或异常列名，
+# 最终每一行都按该顺序输出；无法精确匹配的字段保留为空字符串。
+STANDARD_TABLE_COLUMNS = [
+    '原凭证号',
+    '税种',
+    '品目名称',
+    '税款所属时期',
+    '入（退）库日期',
+    '实缴（退）金额'
+]
+
+
+def _normalize_table_column_name(column_name):
+    """
+    统一表格列名中的空白和括号形式。
+
+    例如：
+    入(退)库日期 -> 入（退）库日期
+    实缴(退)金额 -> 实缴（退）金额
+    """
+    text = ''.join(str(column_name).split())
+
+    return text.translate(str.maketrans({
+        '(': '（',
+        ')': '）',
+        '﹙': '（',
+        '﹚': '）'
+    }))
+
+
+def standardize_table_row(row_dict):
+    """
+    将上游动态表格行转换为固定六列结构。
+
+    仅在去除空白后的列名与标准列名完全一致时复制值；异常列、合并列和
+    未知列不会进入下游结果。None/NaN 统一转换为空字符串。
+    """
+    normalized_standard_columns = {
+        _normalize_table_column_name(column): column
+        for column in STANDARD_TABLE_COLUMNS
+    }
+    standardized_row = {column: '' for column in STANDARD_TABLE_COLUMNS}
+
+    if not isinstance(row_dict, dict):
+        return standardized_row
+
+    for source_column, source_value in row_dict.items():
+        normalized_source_column = _normalize_table_column_name(source_column)
+        target_column = normalized_standard_columns.get(normalized_source_column)
+        if target_column is None:
+            continue
+
+        try:
+            is_empty = source_value is None or bool(pd.isna(source_value))
+        except (TypeError, ValueError):
+            is_empty = source_value is None
+
+        standardized_row[target_column] = '' if is_empty else str(source_value).strip()
+
+    return standardized_row
+
+
+def standardize_table_dataframe(dataframe): 
+    """将模型返回的 DataFrame 统一转换为固定六列 DataFrame。"""
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame(columns=STANDARD_TABLE_COLUMNS)
+
+    # 列名为 0、1、2... 时，表格模型通常把真实表头放在了第一行。
+    has_proper_columns = not all(
+        isinstance(column, int) or str(column).isdigit()
+        for column in dataframe.columns
+    )
+
+    if has_proper_columns:
+        column_names = [
+            _normalize_table_column_name(column)
+            for column in dataframe.columns
+        ]
+        data_start_row = 0
+    else:
+        from difflib import SequenceMatcher
+
+        column_names = [
+            _normalize_table_column_name(value)
+            for value in dataframe.iloc[0].tolist()
+        ]
+        template_4col = ['税种', '税款所属时期', '入（退）库日期', '实缴（退）金额']
+
+        column_text = ''.join(column_names)
+        similarity_6col = SequenceMatcher(
+            None, column_text, ''.join(STANDARD_TABLE_COLUMNS)
+        ).ratio()
+        similarity_4col = SequenceMatcher(
+            None, column_text, ''.join(template_4col)
+        ).ratio()
+        max_similarity = max(similarity_6col, similarity_4col)
+
+        if max_similarity >= 0.8:
+            # 第一行高度接近标准表头，因此只把后续行作为数据。
+            data_start_row = 1
+        else:
+            # 无法可靠识别表头时，仅按已知的 4/6 列模板建立列名。
+            if len(column_names) == 4:
+                column_names = template_4col
+            elif len(column_names) == 6:
+                column_names = STANDARD_TABLE_COLUMNS
+            data_start_row = 0
+
+    standardized_rows = []
+    for row_index in range(data_start_row, len(dataframe)):
+        source_row = dataframe.iloc[row_index]
+        source_row_dict = {
+            column_name: source_row.iloc[column_index]
+            for column_index, column_name in enumerate(column_names)
+            if column_index < len(source_row)
+        }
+        standardized_rows.append(standardize_table_row(source_row_dict))
+
+    return pd.DataFrame(standardized_rows, columns=STANDARD_TABLE_COLUMNS)
+
+
 # 全局变量
 parser_instance = None
 results_cache = {}
@@ -236,6 +360,10 @@ def format_results_for_frontend(results, directory_path):
                 'extracted_fields': result.get('extracted_fields', {})  # 直接使用后端提取的字段
             }
             
+            # TAX_TABLE_REPORT_FRONTEND_V1 (opt-in; default response schema unchanged)
+            if os.environ.get('TAX_POSTPROCESS_REPORT', '0') == '1':
+                image_data['postprocess'] = result.get('_postprocess_report', {})
+
             # 处理分组数据 - 保留完整的 OCR 检测结果
             grouped = result.get('grouped_data', {})
             for label, items in grouped.items():
@@ -259,34 +387,24 @@ def format_results_for_frontend(results, directory_path):
                 # logger.info(f"  table_data 类型: {type(table_data)}")
                 # logger.info(f"  table_data 是否为 None: {table_data is None}")
                 
-                # 即使 table_data 为 None 也要添加，这样前端能知道这个表格存在
+                # 前端展示也必须使用固定六列，不能继续返回模型生成的原始 HTML。
                 if table_data and isinstance(table_data, dict):
-                    # logger.info(f"  HTML 存在: {table_data.get('html') is not None}")
-                    # logger.info(f"  dataframe 存在: {table_data.get('dataframe') is not None}")
-                    if table_data.get('html'):
-                        html_len = len(table_data.get('html', ''))
-                        # logger.info(f"  HTML 长度: {html_len} 字符")
-          
-                        
-                        # 增强 HTML：添加列标题、格式化等
-                        enhanced_html = enhance_table_html(table_data['html'], table_data.get('dataframe'))
-                        
-                        image_data['tables'][table_type] = {
-                            'html': enhanced_html,
-                            'rows': table_data['dataframe'].shape[0] if table_data.get('dataframe') is not None else 0,
-                            'cols': table_data['dataframe'].shape[1] if table_data.get('dataframe') is not None else 0
-                        }
-                        logger.info(f"  ✓ {table_type} 已添加到返回数据")
-                    else:
-                        logger.info(f"  ✗ HTML 为空")
-                        # 即使 HTML 为空，也要添加占位符
-                        image_data['tables'][table_type] = {
-                            'html': '',
-                            'rows': 0,
-                            'cols': 0,
-                            'status': 'empty'
-                        }
-                        logger.info(f"  ℹ {table_type} 已添加空表格占位符")
+                    standardized_df = standardize_table_dataframe(
+                        table_data.get('dataframe')
+                    )
+                    standardized_html = standardized_df.to_html(index=False, border=0)
+                    enhanced_html = enhance_table_html(
+                        standardized_html, standardized_df
+                    )
+
+                    image_data['tables'][table_type] = {
+                        'html': enhanced_html,
+                        'rows': standardized_df.shape[0],
+                        'cols': standardized_df.shape[1]
+                    }
+                    logger.info(
+                        f"  ✓ {table_type} 已按固定六列添加到前端返回数据"
+                    )
                 else:
                     logger.info(f"  ✗ table_data 为空或不存在")
                     # 即使 table_data 为 None，也要添加占位符，这样前端能知道这个表格存在
@@ -555,6 +673,18 @@ def _process_directory_logic(directory_path, recursive, request_tag):
         
         # print('\n\n\n\nresults:',len(results),'个结果:'+'\n\n\n') #+str(results)
         
+        # TAX_TABLE_POSTPROCESS_V1
+        # Single hook for OCR + text PDFs; runs before frontend/API formatting.
+        if os.environ.get('TAX_POSTPROCESS_ENABLED', '1') != '0':
+            try:
+                results = postprocess_internal_results(
+                    results,
+                    thousands=os.environ.get('TAX_POSTPROCESS_THOUSANDS', '1') != '0'
+                )
+            except Exception:
+                # Keep original recognition output if optional repair fails.
+                logger.exception('Tax table post-processing failed; preserving original results')
+
         # 检查是否为前端请求 (requesttag=1)
         if request_tag == 1:
             # ============ 返回前端专有格式 ============
@@ -719,6 +849,10 @@ def _process_directory_logic(directory_path, recursive, request_tag):
                             }
                         }
                         
+                        # TAX_TABLE_REPORT_API_V1 (opt-in)
+                        if os.environ.get('TAX_POSTPROCESS_REPORT', '0') == '1':
+                            result_item['postprocess'] = result.get('_postprocess_report', {})
+
                         # 添加识别的标签作为事项（排除 table、title 等技术标签）
                         if result.get('labels'):
                             labels = [l for l in result.get('labels', []) if l not in ['table', 'table1', 'table2', 'title', 'ink_F', 'ink_T']]
@@ -741,75 +875,13 @@ def _process_directory_logic(directory_path, recursive, request_tag):
                                 logger.info(f"DEBUG: df shape = {df.shape if df is not None else 'None'}")
                                 logger.info(f"DEBUG: df columns = {list(df.columns) if df is not None else 'None'}")
                                 if df is not None and not df.empty:
-                                    # 判断是否已有正确的列名（检查列名是否为数字 0, 1, 2, 3...）
-                                    has_proper_columns = not all(isinstance(col, int) or str(col).isdigit() for col in df.columns)
-                                    logger.info(f"DEBUG: has_proper_columns = {has_proper_columns}")
-                                    
-                                    if has_proper_columns:
-                                        # 情况2：已有正确的列名，直接使用列名
-                                        column_names = [str(col).strip() for col in df.columns]
-                                        data_start_row = 0
-                                    else:
-                                        # 情况1：列名是数字，第一行就是数据（不是列名）
-                                        # 使用第一行数据作为列名，但同时也要包含第一行作为数据
-                                        if len(df) > 0:
-                                            first_row = df.iloc[0].tolist()
-                                            column_names = [str(val).strip() for val in first_row]
-                                            
-                                            # 检查列名相似度，决定是否保留第一行作为数据
-                                            from difflib import SequenceMatcher
-                                            
-                                            def similarity(a, b):
-                                                return SequenceMatcher(None, a, b).ratio()
-                                            
-                                            # 标准列名模板
-                                            template_6col = ['原凭证号', '税种', '品目名称', '税款所属时期', '入（退）库日期', '实缴（退）金额']
-                                            template_4col = ['税种', '税款所属时期', '入（退）库日期', '实缴（退）金额']
-                                            
-                                            # 计算相似度
-                                            col_str = ''.join(column_names)
-                                            sim_6col = similarity(col_str, ''.join(template_6col))
-                                            sim_4col = similarity(col_str, ''.join(template_4col))
-                                            max_similarity = max(sim_6col, sim_4col)
-                                            
-                                            logger.info(f"DEBUG: 列名字符串: {col_str}")
-                                            logger.info(f"DEBUG: 与6列模板相似度: {sim_6col:.3f}")
-                                            logger.info(f"DEBUG: 与4列模板相似度: {sim_4col:.3f}")
-                                            
-                                            if max_similarity >= 0.8:
-                                                # 相似度>=0.8，第一行是列名，跳过第一行
-                                                data_start_row = 1
-                                                logger.info(f"DEBUG: 相似度 {max_similarity:.3f} >= 0.8，第一行是列名")
-                                            else:
-                                                # 相似度<0.8，根据长度匹配标准列名
-                                                if len(column_names) == 4:
-                                                    column_names = template_4col
-                                                    logger.info(f"DEBUG: 相似度 {max_similarity:.3f} < 0.8，长度=4，使用4列模板")
-                                                elif len(column_names) == 6:
-                                                    column_names = template_6col
-                                                    logger.info(f"DEBUG: 相似度 {max_similarity:.3f} < 0.8，长度=6，使用6列模板")
-                                                else:
-                                                    logger.info(f"DEBUG: 相似度 {max_similarity:.3f} < 0.8，长度={len(column_names)}，使用第一行作为列名")
-                                                
-                                                # 第一行作为数据保留
-                                                data_start_row = 0
-                                        else:
-                                            continue
-                                    
-                                    logger.info(f"DEBUG: column_names = {column_names}")
-                                    logger.info(f"DEBUG: data_start_row = {data_start_row}")
-                                    logger.info(f"DEBUG: 将处理 {len(df) - data_start_row} 行数据")
-                                    
-                                    # 从 data_start_row 开始作为数据
-                                    for idx in range(data_start_row, len(df)):
-                                        row = df.iloc[idx]
-                                        row_dict = {}
-                                        for col_idx, col_name in enumerate(column_names):
-                                            if col_idx < len(row):
-                                                row_dict[col_name] = str(row.iloc[col_idx]).strip()
-                                        if row_dict:  # 只添加非空行
-                                            result_item['table'].append(row_dict)
-                                            logger.info(f"DEBUG: 添加了一行数据: {row_dict}")
+                                    standardized_df = standardize_table_dataframe(df)
+                                    standardized_rows = standardized_df.to_dict('records')
+                                    result_item['table'].extend(standardized_rows)
+                                    logger.info(
+                                        f"DEBUG: 添加 {len(standardized_rows)} 行标准化表格数据: "
+                                        f"{standardized_rows}"
+                                    )
                         
                         # 添加额外字段（如果是 PDF）
                         if is_pdf:
@@ -1038,7 +1110,7 @@ def status():
     return make_json_response({
         'status': 'running',
         'service': 'Tax Document Parser API',
-        'port': 8889,
+        'port': 8001,
         'cache_size': len(results_cache),
         'timestamp': datetime.now().isoformat()
     }, 200)
@@ -1060,6 +1132,8 @@ def not_found(error):
 def internal_error(error):
     logger.error(f"内部错误: {str(error)}")
     return make_json_response({'status': 'error', 'message': '服务器内部错误'}, 500)
+
+
 
 
 # ==================== 主程序 ====================
@@ -1089,3 +1163,4 @@ if __name__ == '__main__':
         threaded=True,
         ssl_context=ssl_context
     )
+ 
